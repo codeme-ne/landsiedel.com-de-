@@ -30,7 +30,7 @@
 ## Testing Guidelines
 - Framework: pytest. Tests live in `tests/` and use `test_*.py` naming.
 - Unit tests mock network; do not perform real HTTP calls.
-- `test_integration.py` exercises the full flow and auto-skips if the Argos model is missing.
+- `test_integration.py` exercises the full flow and auto-skips if the Hugging Face backend is unavailable.
 - Add tests for new behavior and regressions; keep fixtures in `tests/fixtures/`.
 
 ## Commit & Pull Request Guidelines
@@ -43,4 +43,3 @@
 - Keep the tool offline-first; avoid introducing external services.
 - Do not commit secrets or environment-specific paths.
 - Use CLI options (`--timeout`, `--retries`, `--output-dir`) instead of globals for configuration.
-

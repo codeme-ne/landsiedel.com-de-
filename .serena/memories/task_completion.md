@@ -1,0 +1,5 @@
+- Ensure changes follow PEP 8, include helpful docstrings/type hints, and avoid new hardcoded paths.
+- Run `pytest -q` (or focused tests) before delivering if changes affect behavior.
+- Provide output diffs under output/ when relevant and document translation results.
+- Adhere to Conventional Commit messages (e.g., `feat(parser): ...`) when committing.
+- Keep tool offline-first; do not add external service dependencies or expose secrets/configs.

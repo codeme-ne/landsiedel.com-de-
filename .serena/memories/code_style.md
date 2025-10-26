@@ -1,0 +1,4 @@
+- Follow PEP 8: 4-space indentation, UTF-8 encoding, snake_case for functions/modules, PascalCase for classes, UPPER_SNAKE_CASE for constants.
+- Prefer small pure functions with explicit errors and no hidden globals; add type hints and docstrings to public APIs.
+- Avoid hardcoded paths; pass directories/URLs/config via parameters or CLI flags.
+- Tests rely on pytest with fixtures under tests/fixtures; mock network access, no real HTTP calls.

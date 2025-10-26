@@ -1,0 +1,4 @@
+- Purpose: Python CLI that fetches German webpages, extracts text, translates to English via Hugging Face MarianMT models, and writes both original and translated HTML copies honoring sitemap batches and caching.
+- Key modules: src/fetcher.py (HTTP with retry/backoff), src/parser.py (BeautifulSoup extraction), src/translator.py (HF batching, caching, heuristics), src/cache.py (SQLite string cache), src/writer.py (apply translations & rewrite links), src/batch.py (sitemap orchestration), src/main.py (CLI entrypoint).
+- Data flow: fetch -> parse -> translate via HF API + cache -> write outputs and logs; supports single URL or sitemap (JSON/XML) batches.
+- Outputs recorded under output/de and output/en directories; optional translation_cache.db for caching.

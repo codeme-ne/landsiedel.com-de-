@@ -5,9 +5,16 @@ import logging
 import sys
 from pathlib import Path
 
+# Load environment variables (for HF_API_TOKEN)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from src.fetcher import fetch, FetchError
-from src.parser import parse
-from src.translator import translate_batch, has_model
+from src.parser import EmbeddedHtmlItem, JsonFieldItem, parse
+from src.translator import translate_batch, has_model, preview_batch
 from src.writer import (
     apply_translations, rewrite_links,
     set_lang, map_paths, save_html
@@ -19,10 +26,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# Suppress noisy library loggers (including sub-loggers)
-logging.getLogger('argostranslate').setLevel(logging.WARNING)
-logging.getLogger('argostranslate.utils').setLevel(logging.WARNING)
-logging.getLogger('stanza').setLevel(logging.WARNING)
+# Suppress noisy library loggers
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +79,33 @@ def main():
         default=3,
         help='Number of retries for failed requests (default: 3)'
     )
+    parser.add_argument(
+        '--check',
+        action='store_true',
+        help='Only run the Hugging Face translation health check and exit'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Plan translations without calling the backend or writing files'
+    )
 
     args = parser.parse_args()
+
+    # Health check mode takes precedence
+    if args.check:
+        if args.dry_run:
+            parser.error("--check cannot be combined with --dry-run")
+        if args.url or args.sitemap:
+            parser.error("--check cannot be combined with --url or --sitemap")
+        if has_model('de', 'en'):
+            logger.info("Hugging Face translation backend is reachable.")
+            sys.exit(0)
+        logger.error(
+            "Hugging Face translation backend unavailable. "
+            "Ensure HF_API_TOKEN is set and network access is available."
+        )
+        sys.exit(1)
 
     # Validate: exactly one of --url or --sitemap
     if not args.url and not args.sitemap:
@@ -81,11 +113,11 @@ def main():
     if args.url and args.sitemap:
         parser.error("Cannot use both --url and --sitemap (mutually exclusive)")
 
-    # Check translation model
-    if not has_model('de', 'en'):
+    # Check translation API access
+    if not args.dry_run and not has_model('de', 'en'):
         logger.error(
-            "Argos DE->EN model not installed. "
-            "Run: argospm install translate-de_en"
+            "Hugging Face translation backend unavailable. "
+            "Set HF_API_TOKEN and verify connectivity with --check."
         )
         sys.exit(1)
 
@@ -103,9 +135,10 @@ def main():
             urls=urls,
             output_dir=args.output_dir,
             delay=args.delay,
-            log_file=getattr(args, 'log_file', None)
+            log_file=getattr(args, 'log_file', None),
+            dry_run=args.dry_run
         )
-        
+
         sys.exit(0 if results['failed'] == 0 else 1)
 
     # Single-URL mode
@@ -132,10 +165,36 @@ def main():
             if isinstance(item, tuple):  # (tag, attr)
                 tag, attr = item
                 texts_to_translate.append(tag[attr])
+            elif isinstance(item, JsonFieldItem):
+                texts_to_translate.append(item.get_value())
+            elif isinstance(item, EmbeddedHtmlItem):
+                texts_to_translate.append(item.get_value())
             else:  # NavigableString
                 texts_to_translate.append(str(item))
 
         # Step 4: Translate
+        if args.dry_run:
+            plan = preview_batch(texts_to_translate, src='de', dst='en')
+            logger.info("Dry run summary for %s", args.url)
+            logger.info("  Total texts: %d", plan.total)
+            logger.info("  Cache hits: %d", plan.cache_hits)
+            logger.info("  Pending translations: %d", len(plan.pending))
+
+            for item in plan.pending[:5]:
+                snippet = str(item.original).strip().replace('\n', ' ')
+                if len(snippet) > 60:
+                    snippet = snippet[:57] + '...'
+                logger.info("    - idx %d: %s", item.index, snippet)
+
+            if len(plan.pending) > 5:
+                logger.info(
+                    "    ... %d additional texts",
+                    len(plan.pending) - 5
+                )
+
+            logger.info("Dry run complete (no files written)")
+            sys.exit(0)
+
         logger.info(f"Translating {len(texts_to_translate)} items")
         translations = translate_batch(
             texts_to_translate,

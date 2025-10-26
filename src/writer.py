@@ -1,10 +1,28 @@
 """HTML writer with translation application and link rewriting"""
+import json
 import logging
 from pathlib import Path
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup, NavigableString
 
+from src.parser import EmbeddedHtmlItem, JsonFieldItem, ScriptHtmlContext
+
 logger = logging.getLogger(__name__)
+
+
+def _replace_text_node(node: NavigableString, translation: str) -> None:
+    """Replace a NavigableString while preserving leading/trailing whitespace."""
+    original = str(node)
+    leading = len(original) - len(original.lstrip())
+    trailing = len(original) - len(original.rstrip())
+
+    result = translation
+    if leading > 0:
+        result = original[:leading] + result
+    if trailing > 0:
+        result = result + original[-trailing:]
+
+    node.replace_with(result)
 
 
 def apply_translations(soup: BeautifulSoup, items: list, translations: list[str]) -> None:
@@ -14,27 +32,18 @@ def apply_translations(soup: BeautifulSoup, items: list, translations: list[str]
     Items can be:
     - NavigableString: replace text content
     - (tag, attr_name): set attribute value
+    - JsonFieldItem: update JSON-LD payloads
+    - EmbeddedHtmlItem: update HTML fragments embedded in scripts
     """
     trans_idx = 0
+    json_contexts: dict[int, JsonFieldItem] = {}
+    fragment_contexts: dict[int, ScriptHtmlContext] = {}
 
     for item in items:
         if isinstance(item, NavigableString):
             # Text node - preserve leading/trailing whitespace
             if trans_idx < len(translations):
-                original = str(item)
-                translation = translations[trans_idx]
-                
-                # Extract whitespace
-                leading = len(original) - len(original.lstrip())
-                trailing = len(original) - len(original.rstrip())
-                
-                # Apply whitespace to translation
-                if leading > 0:
-                    translation = original[:leading] + translation
-                if trailing > 0:
-                    translation = translation + original[-trailing:]
-                
-                item.replace_with(translation)
+                _replace_text_node(item, translations[trans_idx])
                 trans_idx += 1
 
         elif isinstance(item, tuple):
@@ -43,6 +52,35 @@ def apply_translations(soup: BeautifulSoup, items: list, translations: list[str]
             if trans_idx < len(translations):
                 tag[attr_name] = translations[trans_idx]
                 trans_idx += 1
+
+        elif isinstance(item, JsonFieldItem):
+            if trans_idx < len(translations):
+                item.set_value(translations[trans_idx])
+                json_contexts[id(item.payload)] = item
+                trans_idx += 1
+
+        elif isinstance(item, EmbeddedHtmlItem):
+            if trans_idx < len(translations):
+                translation = translations[trans_idx]
+                if item.attr:
+                    item.node[item.attr] = translation
+                else:
+                    _replace_text_node(item.node, translation)
+                item.fragment.dirty = True
+                fragment_contexts[id(item.fragment.context)] = item.fragment.context
+                trans_idx += 1
+
+    # Persist JSON-LD updates
+    for json_item in json_contexts.values():
+        serialized = json.dumps(json_item.payload, ensure_ascii=False, indent=2)
+        if json_item.script_tag.string is None:
+            json_item.script_tag.string = serialized
+        else:
+            json_item.script_tag.string.replace_with(serialized)
+
+    # Persist embedded HTML fragment updates
+    for context in fragment_contexts.values():
+        context.commit()
 
 
 def rewrite_links(soup: BeautifulSoup, from_prefix: str = '/de/', to_prefix: str = '/en/',

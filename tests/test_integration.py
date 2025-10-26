@@ -1,4 +1,4 @@
-"""Integration test with real Argos (optional)"""
+"""Integration test with real Hugging Face backend (optional)."""
 import pytest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,10 +13,10 @@ FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'sample_de.html'
 
 @pytest.mark.skipif(
     not has_model('de', 'en'),
-    reason="Argos DE->EN model not installed"
+    reason="HF translation backend unavailable"
 )
-def test_end_to_end_with_real_argos():
-    """Full pipeline with real Argos translation"""
+def test_end_to_end_with_real_hf():
+    """Full pipeline with real Hugging Face translation backend."""
     # Load fixture
     with open(FIXTURE_PATH, 'r', encoding='utf-8') as f:
         html = f.read()

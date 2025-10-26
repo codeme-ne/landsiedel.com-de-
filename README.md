@@ -1,335 +1,173 @@
 # Website Translation Tool (DE → EN)
 
-TDD-based Python tool for translating German websites to English using Argos Translate.
+Python CLI for turning German webpages into English copies. The pipeline
+fetches HTML, extracts translatable content, calls the Hugging Face Inference
+API (MarianMT models), and writes both the original and translated pages to
+disk. Batching, caching, and retry logic keep the number of remote calls and
+latency under control.
 
-## Features
+## Key Features
+- **HF backend** – uses `Helsinki-NLP/opus-mt-{src}-{dst}` translation models via
+  the Hugging Face Inference API.
+- **Batching + retries** – groups texts per request with exponential backoff and
+  jitter (httpx + tenacity).
+- **SQLite cache** – stores normalized strings in `translation_cache.db` to avoid
+  re-translating shared fragments such as headers and footers.
+- **Skip heuristics** – ignores punctuation-only strings, empty nodes, and text
+  that already looks English when targeting `en`.
+- **Whitespace-safe application** – preserves the DOM structure while inserting
+  translations and adjusting `/de/` links to `/en/`.
+- **Health check** – `python -m src.main --check` verifies API reachability
+  before running a full job.
 
-- **Fetch** HTML with retry logic and validation
-- **Parse** translatable content (text, alt, title, meta)
-- **Translate** using Argos Translate (offline, local)
-- **Batch Processing** via sitemap.json/xml
-- **Whitespace Preservation** around inline elements (links, bold, etc.)
-- **Rewrite** /de/ links to /en/
-- **Preserve** DOM structure
-- **Save** both DE and EN versions
-- **Error Handling** with detailed summary and failed_urls.txt
-- **Rate Limiting** for batch processing
-- **Re-serialize** HTML on save (structure preserved, attribute order may differ)
-
-## Project Structure
+## Repository Layout
 
 ```
 translate/
 ├── src/
-│   ├── __init__.py
-│   ├── fetcher.py       # HTTP fetching with retries
-│   ├── parser.py        # HTML parsing for translation
-│   ├── translator.py    # Argos Translate wrapper
-│   ├── writer.py        # Apply translations & save
-│   ├── batch.py         # Batch processing (sitemap)
+│   ├── fetcher.py       # HTTP fetching with retry/backoff wrappers
+│   ├── parser.py        # BeautifulSoup extraction of texts and attributes
+│   ├── translator.py    # HF batching, caching, skip heuristics
+│   ├── hf_client.py     # httpx client with retry/backoff + error taxonomy
+│   ├── cache.py         # SQLite cache implementation
+│   ├── writer.py        # Apply translations & rewrite links
+│   ├── batch.py         # Batch sitemap processing orchestrator
 │   └── main.py          # CLI entry point
-├── tests/
-│   ├── __init__.py
-│   ├── fixtures/
-│   │   └── sample_de.html
-│   ├── test_fetcher.py
-│   ├── test_parser.py
-│   ├── test_translator.py
-│   ├── test_writer.py
-│   ├── test_batch.py
-│   └── test_integration.py
-├── output/
-│   ├── de/              # Original DE pages
-│   └── en/              # Translated EN pages
-├── requirements.txt
-└── README.md
+├── tests/               # pytest suite (unit + smoke integration)
+├── output/              # Generated HTML (auto-detected `de_NEW` / `en_NEW`, archives under `output/archive/`)
+├── translation_cache.db # Created on first run when caching enabled
+└── requirements.txt
 ```
 
 ## Setup
 
-### 1. Install System Dependencies (for lxml)
+1. **System deps** (for `lxml` on Debian/Ubuntu):
+   ```bash
+   sudo apt-get install libxml2-dev libxslt1-dev
+   ```
 
-```bash
-sudo apt-get install libxml2-dev libxslt1-dev  # Debian/Ubuntu
-```
+2. **Virtual environment**:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
 
-### 2. Create Virtual Environment
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 3. Install Argos Translation Model
-
-```bash
-argospm install translate-de_en
-```
-
-## Quick Start
-
-### Single URL Translation
-```bash
-# Activate virtual environment
-source venv/bin/activate
-
-# Translate one page
-python -m src.main --url https://www.landsiedel.com/de/was-ist-nlp.html --output-dir output
-```
-
-Output:
-```
-output/de/was-ist-nlp.html    # Original German
-output/en/was-ist-nlp.html    # Translated English
-```
-
-### Batch Translation (Sitemap)
-```bash
-# Process multiple URLs from sitemap
-python -m src.main --sitemap sitemap.json --output-dir output
-
-# Limit for testing (first 5 URLs)
-python -m src.main --sitemap sitemap.json --limit 5 --delay 1.0
-
-# With log file
-python -m src.main --sitemap sitemap.json --log-file batch.log
-```
-
-**Batch Output:**
-```
-2025-10-25 21:11:27 - INFO - Loading sitemap: sitemap.json
-2025-10-25 21:11:27 - INFO - Found 101 DE URLs
-2025-10-25 21:11:27 - INFO - Limited to first 3 URLs
-2025-10-25 21:11:27 - INFO - Starting batch processing: 3 URLs
-2025-10-25 21:11:27 - INFO - [1/3] Processing: https://www.landsiedel.com/de/page1.html
-2025-10-25 21:11:41 - INFO - [1/3] Success
-...
-============================================================
-BATCH PROCESSING COMPLETE
-  Processed: 3
-  Success:   3
-  Failed:    0
-  Skipped:   0
-============================================================
-```
-
-**Output Structure:**
-```
-output/
-├── de/
-│   ├── page1.html
-│   └── page2.html
-└── en/
-    ├── page1.html
-    └── page2.html
-```
-
-**Sitemap Formats:**
-
-JSON (custom):
-```json
-[
-  {"url": "https://www.landsiedel.com/de/page1.html"},
-  {"url": "https://www.landsiedel.com/de/page2.html"}
-]
-```
-
-XML (standard sitemap.org):
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://www.landsiedel.com/de/page1.html</loc></url>
-  <url><loc>https://www.landsiedel.com/de/page2.html</loc></url>
-</urlset>
-```
-
-**Batch Workflow:**
-```
-sitemap.json/xml
-       │
-       ▼
- load_sitemap()
-       │
-       ▼
-[URL1, URL2, URL3, ...]
-       │
-       ▼
-   run_batch()
-       │
-       ├─► [1/N] fetch → parse → translate → save (DE + EN)
-       │        └─► delay (rate limiting)
-       ├─► [2/N] fetch → parse → translate → save (DE + EN)
-       │        └─► delay
-       └─► [N/N] fetch → parse → translate → save (DE + EN)
-                 │
-                 ▼
-            Summary Report
-            (success/failed/skipped)
-                 │
-                 ▼
-        failed_urls.txt (if errors)
-```
+3. **Hugging Face token**:
+   - Create a free **Read** token at <https://huggingface.co/settings/tokens>
+   - Either export it or create a `.env` file (loaded automatically by the CLI):
+     ```bash
+     export HF_API_TOKEN="hf_xxx"
+     # or
+     echo "HF_API_TOKEN=hf_xxx" > .env
+     ```
 
 ## Usage
 
-### CLI Options
+### Health Check
 
-**Single URL Mode:**
+Confirm connectivity and credentials before heavier runs:
+
 ```bash
-python -m src.main --url <URL> [OPTIONS]
+python -m src.main --check
 ```
 
-**Batch Mode:**
+Exit code 0 means the backend responded successfully; otherwise the CLI prints a
+diagnostic message.
+
+### Single URL
+
 ```bash
-python -m src.main --sitemap <PATH> [OPTIONS]
+python -m src.main --url https://www.landsiedel.com/de/was-ist-nlp.html --output-dir output
 ```
 
-python -m src.main --sitemap <>
+Writes `output/de/...` (original) and `output/en/...` (translated) after applying
+translations, rewriting `/de/` links, and setting `lang="en"`.
 
-**Options:**
-- `--url`: URL to translate (mutually exclusive with --sitemap)
-- `--sitemap`: Path to sitemap.json or sitemap.xml (mutually exclusive with --url)
-- `--limit`: Max URLs to process (for testing, batch mode only)
-- `--delay`: Delay between requests in seconds (default: 1.0, batch mode only)
-- `--log-file`: Path to log file (optional)
-- `--output-dir`: Output directory (default: `output`)
-- `--timeout`: Request timeout in seconds (default: 10)
-- `--retries`: Number of retries (default: 3)
+### Sitemap Batch
 
-### Programmatic
-
-```python
-from src.fetcher import fetch
-from src.parser import parse
-from src.translator import translate_batch
-from src.writer import apply_translations, rewrite_links, set_lang, save_html
-
-# Fetch
-html, meta = fetch('https://example.com/de/page')
-
-# Parse
-soup, items = parse(html)
-
-# Extract texts
-texts = [str(item).strip() for item in items if hasattr(item, 'strip')]
-
-# Translate
-translations = translate_batch(texts, src='de', dst='en')
-
-# Apply
-apply_translations(soup, items, translations)
-rewrite_links(soup, from_prefix='/de/', to_prefix='/en/')
-set_lang(soup, lang='en')
-
-# Save
-save_html(soup, 'output/en/page.html')
+```bash
+python -m src.main --sitemap sitemap.json --output-dir output --limit 5 --delay 1.0
 ```
+
+- Supports JSON (`[{"url": "..."}]` or `loc` fields) and XML sitemaps.
+- Deduplicates URLs and filters to `www.landsiedel.com` paths containing `/de/`.
+- Produces a summary and `failed_urls.txt` if anything goes wrong.
+
+### CLI Options (excerpt)
+
+- `--url` / `--sitemap` – mutually exclusive entry points.
+- `--limit` – cap number of sitemap entries (debugging).
+- `--delay` – seconds between sitemap requests (rate limiting).
+- `--timeout` / `--retries` – fetcher controls.
+- `--log-file` – optional batch log file.
+- `--output-dir` – root folder for generated HTML (default `output`).
+
+### Interactive Viewer
+
+Inspect original and translated pages in a single browser session:
+
+```bash
+python -m src.webviewer --output-dir output --open-browser
+```
+
+- Automatically selects `output/de_NEW` and `output/en_NEW` when present (falls back to `de` / `en`).
+- Shows the directory tree on the left; preview uses the full width with a language toggle between EN/DE.
+- Provides ready-to-send ZIP downloads for each language (also stored under `output/packages/`).
+- Override with `--source-subdir` / `--target-subdir` for archival sets (now stored under `output/archive/`).
+- Retries up to five consecutive ports if 8000 is busy; tweak with `--port-attempts`.
+- Bind to a different host/port using `--host` / `--port` if needed.
+
+Visit `http://127.0.0.1:8000/` (or whichever host/port you chose) to explore the files. Close the process with `Ctrl+C`.
+
+### Publish to GitHub Pages
+
+Generate a self-contained static viewer (under `docs/`) that GitHub Pages can host:
+
+```bash
+python -m src.static_site --output-dir output --site-dir docs
+```
+
+- Copies the current `de_NEW` / `en_NEW` trees into `docs/de` and `docs/en`.
+- Emits `docs/index.html`, `docs/data/tree.json`, and ZIP downloads in `docs/packages/`.
+- Push the repository with the `docs/` folder to GitHub and enable Pages (`Settings → Pages → Deploy from branch → main / docs`).
+- Each time translations change, re-run the command before committing so the site stays in sync.
+- Optional automation: the included GitHub Actions workflow (`.github/workflows/pages.yml`) rebuilds `docs/` and deploys to GitHub Pages on every push to `main`. Enable Pages (branch = `github-pages` deployment) after the first run.
 
 ## Testing
 
-Run all tests:
+The test suite relies on mocked network calls; no real HTTP requests are
+performed:
+
 ```bash
 pytest -q
 ```
 
-Run specific test file:
-```bash
-pytest tests/test_fetcher.py -v
-pytest tests/test_batch.py -v
-```
+Targeted runs:
 
-Run with coverage:
 ```bash
-pytest --cov=src tests/
+pytest tests/test_translator.py -v          # translator helpers + caching logic
+pytest tests/test_batch.py -k sitemap       # sitemap parsing
 ```
 
 ## Troubleshooting
 
-### "Argos DE->EN model not installed"
-```bash
-# Install the translation model
-argospm install translate-de_en
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `HF authentication failed` | `HF_API_TOKEN` missing or invalid | regenerate token and export / update `.env` |
+| `Translation API error: 429` | Rate limit hit | wait for daily reset or lower concurrency (`--delay`) |
+| Pages re-process slowly | Cache disabled or purged | ensure `translation_cache.db` exists and writable |
+| CLI exits immediately | `--url`/`--sitemap` not specified | supply exactly one of the entry-point flags |
 
-# Verify installation
-argospm list
-```
+For deeper diving (response payloads, caching internals) see
+[`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md).
 
-### "FetchError: Non-HTML content"
-- URL liefert PDF/Image statt HTML
-- Wird automatisch als "skipped" gezählt (Batch-Mode)
+## Operational Notes
 
-### Schlechte Übersetzungsqualität
-Siehe [Translation Quality Improvements](#translation-quality-improvements) für Alternativen:
-- **Quick Win**: DeepL Free (500K chars/Monat)
-- **Best Quality**: Gemini 1.5 Flash oder Haiku 3
-
-### Leerzeichen fehlen bei Links/Bold
-Fixed in v1.1 (Whitespace Preservation).
-Falls Problem weiterhin besteht:
-```bash
-git pull
-pip install -r requirements.txt --upgrade
-```
-
-### Batch-Processing zu langsam
-```bash
-# Reduziere Delay (Vorsicht: Rate-Limiting!)
-python -m src.main --sitemap sitemap.json --delay 0.3
-
-# Oder limitiere URLs für Testing
-python -m src.main --sitemap sitemap.json --limit 10
-```
-
-## Module Contracts
-
-### fetcher.py
-- `fetch(url, timeout, retries) → (html, meta)`
-- Returns decoded HTML and metadata (final_url, encoding, content_type, status)
-- Raises `FetchError` for non-HTML, 4xx/5xx after retries, or timeouts
-
-### parser.py
-- `parse(html) → (soup, items)`
-- Returns BeautifulSoup object and list of translatable items
-- Items: NavigableString refs + (tag, attr) tuples for alt/title/meta
-
-### translator.py
-- `has_model(src, dst) → bool`
-- `translate_batch(texts, src, dst) → list[str]`
-- Batch translation preserving order and empty strings
-
-### writer.py
-- `apply_translations(soup, items, translations) → None` (in-place, preserves whitespace)
-- `rewrite_links(soup, from_prefix, to_prefix) → None`
-- `set_lang(soup, lang) → None`
-- `map_paths(url, output_dir) → (de_path, en_path)`
-- `save_html(soup, path, encoding) → None`
-
-### batch.py
-- `load_sitemap_json(path) → list[str]` (deduplicated, filtered)
-- `load_sitemap_xml(path) → list[str]` (namespace-safe)
-- `load_sitemap(path) → list[str]` (auto-detect JSON/XML)
-- `process_single_url(url, output_dir) → None` (full pipeline)
-- `run_batch(urls, output_dir, delay, log_file) → dict` (orchestrator)
-
-## Quality Gates
-
-- ✓ All unit tests pass offline (network mocked)
-- ✓ Integration test passes with Argos model (skipped if not installed)
-- ✓ 41 tests pass (17 batch + 24 core)
-- ✓ DOM structure preserved pre/post translation
-- ✓ Whitespace preserved around inline elements (links, bold)
-- ✓ No /de/ links in EN output
-- ✓ `<html lang="en">` set correctly
-- ✓ UTF-8 encoding for all outputs
-- ✓ Batch processing: FetchError → skipped, Exception → failed
-- ✓ failed_urls.txt created on errors
-- ✓ Rate limiting functional (configurable delay)
-
-## Design Principles
-
-- **TDD**: Tests written before implementation
-- **Simplicity**: Small functions, explicit error handling
-- **Offline-first**: Works without external API calls
-- **Fail-loud**: Explicit validation and error messages
-- **No magic**: Clear naming, no hidden behavior
+- Caching can be cleared by deleting `translation_cache.db`.
+- Translation batches respect both a maximum item count (`BATCH_SIZE`) and an
+  approximate token budget (`MAX_TOKENS_PER_BATCH`) to keep requests within free
+  tier limits.
+- Network access is required; no offline fallback is currently implemented.
+- The CLI still supports the rest of the legacy pipeline contracts so existing
+  integrations can reuse `translate_batch()` and `has_model()`.

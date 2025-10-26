@@ -1,0 +1,8 @@
+- Setup venv: `python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt`
+- Install translation model locally when needed: `argospm install translate-de_en`
+- Run CLI health check: `python -m src.main --check`
+- Translate single URL: `python -m src.main --url <https://example.com/de/page> --output-dir output`
+- Batch via sitemap: `python -m src.main --sitemap sitemap.json --output-dir output --limit 5 --delay 1.0`
+- Run full tests: `pytest -q`
+- Focused tests: `pytest tests/test_parser.py -v` or `pytest -k translator -q`
+- Optional coverage: `pytest --cov=src tests/`

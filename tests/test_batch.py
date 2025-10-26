@@ -3,6 +3,7 @@
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch, MagicMock
 
 import pytest
@@ -163,10 +164,17 @@ class TestProcessSingleUrl:
     
     @patch('src.batch.fetch')
     @patch('src.batch.parse')
+    @patch('src.batch.preview_batch')
     @patch('src.batch.translate_batch')
     @patch('src.batch.save_html')
     def test_process_single_url_success(
-        self, mock_save, mock_translate, mock_parse, mock_fetch, tmp_path
+        self,
+        mock_save,
+        mock_translate,
+        mock_preview,
+        mock_parse,
+        mock_fetch,
+        tmp_path
     ):
         """Test successful processing of single URL"""
         # Mock fetch
@@ -181,6 +189,9 @@ class TestProcessSingleUrl:
         mock_items = ["Text 1"]
         mock_parse.return_value = (mock_soup, mock_items)
         
+        # Mock preview (should not be used in normal mode)
+        mock_preview.return_value = SimpleNamespace(total=1, cache_hits=0, pending=[])
+
         # Mock translate
         mock_translate.return_value = ["Text 1 translated"]
         
@@ -192,10 +203,55 @@ class TestProcessSingleUrl:
         
         # Verify calls
         assert mock_fetch.called
+        mock_preview.assert_not_called()
         assert mock_parse.call_count == 2  # Once for EN, once for DE
         assert mock_translate.called
         assert mock_save.call_count == 2  # DE + EN
-    
+
+    @patch('src.batch.translate_batch')
+    @patch('src.batch.preview_batch')
+    @patch('src.batch.parse')
+    @patch('src.batch.fetch')
+    def test_process_single_url_dry_run(
+        self,
+        mock_fetch,
+        mock_parse,
+        mock_preview,
+        mock_translate,
+        tmp_path
+    ):
+        """Dry-run should plan translations without invoking translate_batch."""
+
+        mock_html = "<html><body>Hallo</body></html>"
+        mock_fetch.return_value = (
+            mock_html,
+            {'final_url': 'https://www.landsiedel.com/de/test.html'}
+        )
+
+        mock_parse.return_value = (MagicMock(), ["Hallo"])
+
+        mock_preview.return_value = SimpleNamespace(
+            total=1,
+            cache_hits=0,
+            pending=[SimpleNamespace(index=0, original="Hallo")]
+        )
+
+        summary = process_single_url(
+            'https://www.landsiedel.com/de/test.html',
+            str(tmp_path),
+            dry_run=True
+        )
+
+        assert summary == {
+            'url': 'https://www.landsiedel.com/de/test.html',
+            'total_texts': 1,
+            'cache_hits': 0,
+            'pending_translations': 1
+        }
+        mock_preview.assert_called_once()
+        mock_translate.assert_not_called()
+        assert mock_parse.call_count == 1
+
     @patch('src.batch.fetch')
     def test_process_single_url_fetch_error(self, mock_fetch, tmp_path):
         """Test that FetchError is propagated"""
@@ -278,7 +334,33 @@ class TestRunBatch:
     def test_run_batch_no_delay_after_last_url(self, mock_sleep, mock_process, tmp_path):
         """Test that delay is not applied after the last URL"""
         urls = ['https://www.landsiedel.com/de/page.html']
-        
+
         run_batch(urls, str(tmp_path), delay=1.0)
-        
+
         assert not mock_sleep.called  # No sleep for single URL
+
+    @patch('src.batch.process_single_url')
+    @patch('src.batch.time.sleep')
+    def test_run_batch_dry_run_collects_stats(self, mock_sleep, mock_process, tmp_path):
+        urls = [
+            'https://www.landsiedel.com/de/page1.html',
+            'https://www.landsiedel.com/de/page2.html',
+        ]
+
+        mock_process.side_effect = [
+            {'url': urls[0], 'total_texts': 3, 'cache_hits': 1, 'pending_translations': 2},
+            {'url': urls[1], 'total_texts': 2, 'cache_hits': 0, 'pending_translations': 2},
+        ]
+
+        results = run_batch(urls, str(tmp_path), delay=0.0, dry_run=True)
+
+        assert results['success'] == 2
+        assert results['failed'] == 0
+        assert results['skipped'] == 0
+        assert results['dry_run'] == {
+            'urls': 2,
+            'total_texts': 5,
+            'cache_hits': 1,
+            'pending_translations': 4
+        }
+        assert mock_process.call_args_list[0].kwargs['dry_run'] is True
