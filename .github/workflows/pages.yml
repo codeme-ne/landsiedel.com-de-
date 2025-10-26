@@ -42,6 +42,7 @@ jobs:
       - name: Generate static site
         env:
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           python src/static_site.py
 
