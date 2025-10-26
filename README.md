@@ -17,7 +17,7 @@ latency under control.
   that already looks English when targeting `en`.
 - **Whitespace-safe application** – preserves the DOM structure while inserting
   translations and adjusting `/de/` links to `/en/`.
-- **Health check** – `python -m src.main --check` verifies API reachability
+- **Health check** – `python -m src.main --check` verifies API reachability.
   before running a full job.
 
 ## Repository Layout
