@@ -1,0 +1,31 @@
+# Environment variables (contains API token!)
+.env
+
+# SQLite cache files
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Backups
+*.backup
+
+# Test outputs
+test_output/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
