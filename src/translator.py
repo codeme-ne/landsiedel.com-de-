@@ -6,9 +6,9 @@ import logging
 import math
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from src.cache import TranslationCache
 from src.config import (
@@ -27,13 +27,59 @@ from src.hf_client import AuthenticationError, HfApiError, HfClient
 
 logger = logging.getLogger(__name__)
 
-# Global cache instance (lazy-initialized)
-_cache: Optional[TranslationCache] = None
-
-# Argos translator cache to avoid reloading packages repeatedly
-_ARGOS_TRANSLATORS: dict[tuple[str, str], Optional[object]] = {}
-
 _MAX_LOG_SNIPPET = 80
+
+
+@dataclass
+class TranslationContext:
+    """Encapsulates translation state to enable thread-safe, concurrent pipelines.
+
+    This class owns the translation cache and Argos translator instances,
+    eliminating global mutable state and enabling:
+    - Multiple concurrent pipelines with isolated caches
+    - Thread-safe operation
+    - Easy testing with mock contexts
+    """
+
+    cache: Optional[TranslationCache] = None
+    argos_translators: dict[tuple[str, str], Any] = field(default_factory=dict)
+
+    @classmethod
+    def create(cls, cache_enabled: bool = True, cache_path: Optional[str] = None) -> TranslationContext:
+        """Create a new context with optional cache.
+
+        Args:
+            cache_enabled: Whether to enable caching (defaults to True)
+            cache_path: Custom cache path (defaults to CACHE_PATH from config)
+
+        Returns:
+            New TranslationContext instance
+        """
+        cache = None
+        if cache_enabled and CACHE_ENABLED:
+            path = cache_path or CACHE_PATH
+            try:
+                cache = TranslationCache(path)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to initialize cache: %s", exc)
+
+        return cls(cache=cache)
+
+
+# Default context for backward compatibility (lazy-initialized)
+_default_context: Optional[TranslationContext] = None
+
+
+def _get_default_context() -> TranslationContext:
+    """Get or create the default context for backward compatibility.
+
+    This enables existing code to work without modification while
+    new code can use explicit context passing.
+    """
+    global _default_context
+    if _default_context is None:
+        _default_context = TranslationContext.create()
+    return _default_context
 
 
 @dataclass
@@ -68,30 +114,6 @@ class TranslationPlan:
 
 class ArgosTranslationError(Exception):
     """Raised when the Argos fallback backend cannot translate text."""
-
-
-def _get_cache() -> Optional[TranslationCache]:
-    """Get or create a global cache instance."""
-
-    global _cache
-    if not CACHE_ENABLED:
-        return None
-
-    if _cache is not None:
-        if Path(CACHE_PATH) != _cache.cache_path:
-            try:
-                _cache = TranslationCache(CACHE_PATH)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.warning("Failed to reinitialize cache: %s", exc)
-                _cache = None
-
-    if _cache is None:
-        try:
-            _cache = TranslationCache(CACHE_PATH)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning("Failed to initialize cache: %s", exc)
-            return None
-    return _cache
 
 
 def _normalize_text(text: str) -> str:
@@ -162,8 +184,20 @@ def _build_translation_plan(
     *,
     backend: str = "hf",
     use_cache: bool = True,
+    context: Optional[TranslationContext] = None,
 ) -> TranslationPlan:
-    """Prepare translation work by applying skips and cache lookups."""
+    """Prepare translation work by applying skips and cache lookups.
+
+    Args:
+        texts: List of texts to translate
+        src: Source language code
+        dst: Destination language code
+        backend: Translation backend to use
+        use_cache: Whether to use cache
+        context: Translation context (uses default if None)
+    """
+    if context is None:
+        context = _get_default_context()
 
     total = len(texts)
     results: list[Optional[str]] = list(texts)
@@ -204,7 +238,7 @@ def _build_translation_plan(
             candidate_count=candidate_count,
         )
 
-    cache = _get_cache() if (use_cache and backend != "argos") else None
+    cache = context.cache if (use_cache and backend != "argos") else None
     if cache:
         cache_keys = [item.normalized for item in pending]
         cached = cache.get_many(cache_keys, src, dst, cache_tag)
@@ -234,11 +268,23 @@ def _build_translation_plan(
     )
 
 
-def preview_batch(texts: list[str], src: str = "de", dst: str = "en") -> TranslationPlan:
-    """Return a translation plan without performing any API calls."""
+def preview_batch(
+    texts: list[str],
+    src: str = "de",
+    dst: str = "en",
+    *,
+    context: Optional[TranslationContext] = None,
+) -> TranslationPlan:
+    """Return a translation plan without performing any API calls.
 
+    Args:
+        texts: List of texts to preview
+        src: Source language code
+        dst: Destination language code
+        context: Translation context (uses default if None)
+    """
     backend = get_backend_name()
-    return _build_translation_plan(texts, src, dst, backend=backend, use_cache=True)
+    return _build_translation_plan(texts, src, dst, backend=backend, use_cache=True, context=context)
 
 
 def _log_plan_summary(plan: TranslationPlan, backend: str, dry_run: bool) -> None:
@@ -270,14 +316,25 @@ def translate_batch(
     dst: str = "en",
     *,
     dry_run: bool = False,
+    context: Optional[TranslationContext] = None,
 ) -> list[str]:
-    """Translate a list of strings while preserving order and applying caching."""
+    """Translate a list of strings while preserving order and applying caching.
+
+    Args:
+        texts: List of texts to translate
+        src: Source language code
+        dst: Destination language code
+        dry_run: If True, only preview without actual translation
+        context: Translation context (uses default if None)
+    """
+    if context is None:
+        context = _get_default_context()
 
     if not texts:
         return []
 
     backend = get_backend_name()
-    plan = _build_translation_plan(texts, src, dst, backend=backend, use_cache=not dry_run)
+    plan = _build_translation_plan(texts, src, dst, backend=backend, use_cache=not dry_run, context=context)
     _log_plan_summary(plan, backend, dry_run)
 
     if dry_run:
@@ -291,7 +348,7 @@ def translate_batch(
         logger.info("All translations served from cache!")
         return plan.finalize(texts)
 
-    if not has_model(src, dst):
+    if not has_model(src, dst, context=context):
         if backend == "argos":
             raise RuntimeError(
                 f"Argos translation backend unavailable for {src}->{dst}. "
@@ -306,7 +363,7 @@ def translate_batch(
     pending_items = plan.pending
 
     try:
-        with _translation_callable(backend, src, dst) as translate_fn:
+        with _translation_callable(backend, src, dst, context) as translate_fn:
             batch_number = 0
             cursor = 0
             total_items = len(pending_items)
@@ -384,10 +441,9 @@ def translate_batch(
                 plan.results[item.index] = item.original
         raise
 
-    cache = _get_cache()
-    if cache and new_translations:
+    if context.cache and new_translations:
         try:
-            cache.set_many(new_translations, src, dst, plan.cache_tag)
+            context.cache.set_many(new_translations, src, dst, plan.cache_tag)
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning("Failed to update cache: %s", exc)
 
@@ -414,22 +470,35 @@ def _translation_callable(
     backend: str,
     src: str,
     dst: str,
+    context: TranslationContext,
 ) -> Iterator[Callable[[list[str]], list[str]]]:
-    """Yield a callable that performs translations for the selected backend."""
+    """Yield a callable that performs translations for the selected backend.
 
+    Args:
+        backend: Translation backend to use
+        src: Source language code
+        dst: Destination language code
+        context: Translation context for Argos translators
+    """
     if backend == "hf":
         with HfClient(timeout=HF_API_TIMEOUT, max_retries=HF_MAX_RETRIES) as client:
             yield lambda texts: client.translate_texts(texts, src=src, dst=dst)
     elif backend == "argos":
-        yield lambda texts: _argos_translate_texts(texts, src, dst)
+        yield lambda texts: _argos_translate_texts(texts, src, dst, context)
     else:  # pragma: no cover - configuration guard
         raise ValueError(f"Unsupported translation backend: {backend}")
 
 
-def _argos_translate_texts(texts: list[str], src: str, dst: str) -> list[str]:
-    """Translate texts using the Argos Translate fallback backend."""
+def _argos_translate_texts(texts: list[str], src: str, dst: str, context: TranslationContext) -> list[str]:
+    """Translate texts using the Argos Translate fallback backend.
 
-    translator = _load_argos_translator(src, dst)
+    Args:
+        texts: List of texts to translate
+        src: Source language code
+        dst: Destination language code
+        context: Translation context containing Argos translators cache
+    """
+    translator = _load_argos_translator(src, dst, context)
     if translator is None:
         raise ArgosTranslationError(
             f"Argos translator for {src}->{dst} not installed. Install it via "
@@ -445,12 +514,69 @@ def _argos_translate_texts(texts: list[str], src: str, dst: str) -> list[str]:
     return translations
 
 
-def _load_argos_translator(src: str, dst: str) -> Optional[object]:
-    """Load (and cache) an Argos translator for the given language pair."""
+def _get_argos_attr(obj: object, attr_name: str):
+    """Get attribute from Argos object, handling callable getters."""
+    value = getattr(obj, attr_name, None)
+    if value is None:
+        return None
+    if callable(value):
+        try:
+            return value()
+        except TypeError:
+            pass  # Some versions expose attributes directly
+    return value
 
+
+def _resolve_argos_lang_code(value: object) -> Optional[str]:
+    """Extract language code from Argos language object."""
+    if value is None:
+        return None
+    code = _get_argos_attr(value, "code")
+    return code if isinstance(code, str) else (value if isinstance(value, str) else None)
+
+
+def _find_argos_translator(languages: list, src: str, dst: str) -> Optional[object]:
+    """Search installed Argos languages for matching translator."""
+    for language in languages:
+        lang_code = _get_argos_attr(language, "code")
+        if lang_code != src:
+            continue
+
+        # Check all possible translation collection attributes
+        translation_attrs = ("translations", "translations_from", "translations_to")
+        candidates = [_get_argos_attr(language, attr) for attr in translation_attrs]
+
+        for collection in filter(None, candidates):
+            for candidate in filter(None, collection):
+                # Try multiple attribute names for source/target codes
+                source_code = (
+                    _resolve_argos_lang_code(_get_argos_attr(candidate, "from_lang"))
+                    or _resolve_argos_lang_code(_get_argos_attr(candidate, "from_code"))
+                    or lang_code
+                )
+                if source_code != src:
+                    continue
+
+                target_code = (
+                    _resolve_argos_lang_code(_get_argos_attr(candidate, "to_lang"))
+                    or _resolve_argos_lang_code(_get_argos_attr(candidate, "to_code"))
+                )
+                if target_code == dst:
+                    return candidate
+    return None
+
+
+def _load_argos_translator(src: str, dst: str, context: TranslationContext) -> Optional[object]:
+    """Load (and cache) an Argos translator for the given language pair.
+
+    Args:
+        src: Source language code
+        dst: Destination language code
+        context: Translation context containing Argos translators cache
+    """
     key = (src, dst)
-    if key in _ARGOS_TRANSLATORS:
-        return _ARGOS_TRANSLATORS[key]
+    if key in context.argos_translators:
+        return context.argos_translators[key]
 
     try:
         from argostranslate import translate as argos_translate
@@ -459,111 +585,60 @@ def _load_argos_translator(src: str, dst: str) -> Optional[object]:
             "TRANSLATOR_BACKEND=argos but argostranslate is not installed. "
             "Run `pip install argostranslate argostranslate-models` to enable the fallback."
         )
-        _ARGOS_TRANSLATORS[key] = None
+        context.argos_translators[key] = None
         return None
 
     try:
         languages = argos_translate.load_installed_languages()
     except Exception as exc:
         logger.error("Failed to load Argos languages: %s", exc)
-        _ARGOS_TRANSLATORS[key] = None
+        context.argos_translators[key] = None
         return None
 
-    def _get_attr(obj: object, attr_name: str):
-        value = getattr(obj, attr_name, None)
-        if value is None:
-            return None
-        if callable(value):
-            try:
-                value = value()
-            except TypeError:
-                # Some Argos versions expose lists directly
-                pass
-        return value
-
-    def _resolve_lang_code(value: object) -> Optional[str]:
-        if value is None:
-            return None
-        code = getattr(value, "code", None)
-        if callable(code):
-            try:
-                code = code()
-            except TypeError:
-                pass
-        if isinstance(code, str):
-            return code
-        if isinstance(value, str):
-            return value
-        return None
-
-    translator = None
-    for language in languages:
-        lang_code = getattr(language, "code", None)
-        if callable(lang_code):  # Older versions expose getters
-            lang_code = lang_code()
-        if lang_code != src:
-            continue
-
-        collections: list = []
-        for attr_name in ("translations", "translations_from", "translations_to"):
-            collection = _get_attr(language, attr_name)
-            if collection:
-                collections.append(collection)
-
-        for candidates in collections:
-            for candidate in candidates:
-                if candidate is None:
-                    continue
-
-                source_code = _resolve_lang_code(_get_attr(candidate, "from_lang"))
-                if source_code is None:
-                    source_code = _resolve_lang_code(_get_attr(candidate, "from_code"))
-                if source_code is None:
-                    source_code = lang_code
-                if source_code != src:
-                    continue
-
-                target_code = _resolve_lang_code(_get_attr(candidate, "to_lang"))
-                if target_code is None:
-                    target_code = _resolve_lang_code(_get_attr(candidate, "to_code"))
-
-                if target_code == dst:
-                    translator = candidate
-                    break
-            if translator:
-                break
-        if translator:
-            break
+    translator = _find_argos_translator(languages, src, dst)
 
     if translator is None:
         logger.warning(
-            "Argos fallback missing language pair %s -> %s. Install it via `argospm install translate-%s_%s`.",
+            "Argos fallback missing language pair %s -> %s. "
+            "Install it via `argospm install translate-%s_%s`.",
             src,
             dst,
             src,
             dst,
         )
 
-    _ARGOS_TRANSLATORS[key] = translator
+    context.argos_translators[key] = translator
     return translator
 
 
-def _argos_has_model(src: str, dst: str) -> bool:
-    """Return True when the Argos backend can handle the language pair."""
+def _argos_has_model(src: str, dst: str, context: Optional[TranslationContext] = None) -> bool:
+    """Return True when the Argos backend can handle the language pair.
 
-    return _load_argos_translator(src, dst) is not None
+    Args:
+        src: Source language code
+        dst: Destination language code
+        context: Translation context (uses default if None)
+    """
+    if context is None:
+        context = _get_default_context()
+    return _load_argos_translator(src, dst, context) is not None
 
 
-def has_model(src: str = "de", dst: str = "en") -> bool:
-    """Check if translation is available for the configured backend."""
+def has_model(src: str = "de", dst: str = "en", *, context: Optional[TranslationContext] = None) -> bool:
+    """Check if translation is available for the configured backend.
 
+    Args:
+        src: Source language code
+        dst: Destination language code
+        context: Translation context (uses default if None)
+    """
     if src not in LANGUAGE_MAP or dst not in LANGUAGE_MAP:
         logger.warning("Unsupported language pair: %s -> %s", src, dst)
         return False
 
     backend = get_backend_name()
     if backend == "argos":
-        return _argos_has_model(src, dst)
+        return _argos_has_model(src, dst, context)
 
     try:
         with HfClient(timeout=HF_API_TIMEOUT, max_retries=HF_MAX_RETRIES) as client:
@@ -576,6 +651,7 @@ def has_model(src: str = "de", dst: str = "en") -> bool:
 
 
 __all__ = [
+    "TranslationContext",
     "has_model",
     "preview_batch",
     "translate_batch",

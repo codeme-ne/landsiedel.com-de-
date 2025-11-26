@@ -3,15 +3,19 @@
 import json
 import logging
 import time
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from lxml import etree
 
 from src.fetcher import fetch, FetchError
-from src.parser import EmbeddedHtmlItem, JsonFieldItem, parse
+from src.parser import parse
+from src.pipeline import extract_texts
 from src.translator import preview_batch, translate_batch
 from src.writer import (
     apply_translations, rewrite_links,
@@ -21,6 +25,33 @@ from src.writer import (
 logger = logging.getLogger(__name__)
 
 SITEMAP_NAMESPACE = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+
+
+class RateLimiter:
+    """Token bucket rate limiter for concurrent requests."""
+
+    def __init__(self, max_requests: int = 5, time_window: float = 1.0):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests: deque = deque()
+        self.lock = threading.Lock()
+
+    def wait_if_needed(self):
+        """Block if rate limit exceeded."""
+        with self.lock:
+            now = time.time()
+            # Remove old requests outside time window
+            while self.requests and self.requests[0] < now - self.time_window:
+                self.requests.popleft()
+
+            # Wait if at limit
+            if len(self.requests) >= self.max_requests:
+                sleep_time = self.time_window - (now - self.requests[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                self.requests.popleft()
+
+            self.requests.append(time.time())
 
 
 def load_sitemap_json(path: str) -> list[str]:
@@ -157,19 +188,9 @@ def process_single_url(url: str, output_dir: str, dry_run: bool = False) -> Opti
     
     # Parse
     soup, items = parse(html)
-    
+
     # Extract texts
-    texts_to_translate = []
-    for item in items:
-        if isinstance(item, tuple):  # (tag, attr)
-            tag, attr = item
-            texts_to_translate.append(tag[attr])
-        elif isinstance(item, JsonFieldItem):
-            texts_to_translate.append(item.get_value())
-        elif isinstance(item, EmbeddedHtmlItem):
-            texts_to_translate.append(item.get_value())
-        else:  # NavigableString
-            texts_to_translate.append(str(item))
+    texts_to_translate = extract_texts(items)
     
     if dry_run:
         plan = preview_batch(texts_to_translate, src='de', dst='en')
@@ -209,10 +230,10 @@ def process_single_url(url: str, output_dir: str, dry_run: bool = False) -> Opti
     
     # Map output paths
     de_path, en_path = map_paths(meta['final_url'], output_dir)
-    
-    # Save original DE version (re-parse for clean copy)
-    de_soup, _ = parse(html)
-    save_html(de_soup, de_path)
+
+    # Save original DE version (raw HTML, no re-parsing needed)
+    Path(de_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(de_path).write_text(html, encoding='utf-8')
     
     # Save translated EN version
     save_html(soup, en_path)
@@ -226,19 +247,21 @@ def process_single_url(url: str, output_dir: str, dry_run: bool = False) -> Opti
 def run_batch(
     urls: list[str],
     output_dir: str,
-    delay: float = 1.0,
+    delay: float = 0.2,
     log_file: Optional[str] = None,
-    dry_run: bool = False
-) -> dict:
+    dry_run: bool = False,
+    max_workers: int = 5
+) -> dict[str, Any]:
     """
     Process multiple URLs from a sitemap with error handling and rate limiting.
 
     Args:
         urls: List of URLs to process
         output_dir: Output directory for HTML files
-        delay: Delay in seconds between requests (default 1.0)
+        delay: Delay in seconds between requests (default 0.2, deprecated in favor of rate limiter)
         log_file: Optional log file path
         dry_run: When True, plan translations without calling the backend
+        max_workers: Maximum number of concurrent workers (default 5)
 
     Returns:
         {
@@ -269,34 +292,53 @@ def run_batch(
     } if dry_run else None
 
     total = len(urls)
-    logger.info(f"Starting batch processing: {total} URLs (dry-run={dry_run})")
+    logger.info(f"Starting batch processing: {total} URLs (dry-run={dry_run}, workers={max_workers})")
 
-    for i, url in enumerate(urls, start=1):
-        logger.info(f"[{i}/{total}] Processing: {url}")
+    # Create rate limiter for concurrent requests
+    rate_limiter = RateLimiter(max_requests=max_workers, time_window=1.0)
+    completed_count = 0
+    lock = threading.Lock()
 
+    def process_with_rate_limit(url: str) -> tuple[str, Optional[dict], Optional[Exception], str]:
+        """Process URL with rate limiting. Returns (url, summary, error, error_type)."""
+        rate_limiter.wait_if_needed()
         try:
             summary = process_single_url(url, output_dir, dry_run=dry_run)
-            success += 1
-            logger.info(f"[{i}/{total}] Success")
-
-            if dry_stats is not None and summary:
-                dry_stats['urls'] += 1
-                dry_stats['total_texts'] += summary['total_texts']
-                dry_stats['cache_hits'] += summary['cache_hits']
-                dry_stats['pending_translations'] += summary['pending_translations']
-
+            return (url, summary, None, '')
         except FetchError as exc:
-            skipped += 1
-            logger.warning(f"[{i}/{total}] Skipped (fetch error): {exc}")
-
+            return (url, None, exc, 'fetch')
         except Exception as exc:
-            failed += 1
-            error_msg = str(exc)
-            failed_urls.append((url, error_msg))
-            logger.error(f"[{i}/{total}] Failed: {exc}", exc_info=True)
+            return (url, None, exc, 'other')
 
-        if i < total:
-            time.sleep(delay)
+    # Process URLs concurrently
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_with_rate_limit, url): url for url in urls}
+
+        for future in as_completed(futures):
+            url, summary, error, error_type = future.result()
+
+            with lock:
+                completed_count += 1
+
+                if error is None:
+                    success += 1
+                    logger.info(f"[{completed_count}/{total}] Success: {url}")
+
+                    if dry_stats is not None and summary:
+                        dry_stats['urls'] += 1
+                        dry_stats['total_texts'] += summary['total_texts']
+                        dry_stats['cache_hits'] += summary['cache_hits']
+                        dry_stats['pending_translations'] += summary['pending_translations']
+
+                elif error_type == 'fetch':
+                    skipped += 1
+                    logger.warning(f"[{completed_count}/{total}] Skipped (fetch error): {url} - {error}")
+
+                else:
+                    failed += 1
+                    error_msg = str(error)
+                    failed_urls.append((url, error_msg))
+                    logger.error(f"[{completed_count}/{total}] Failed: {url} - {error}", exc_info=error)
 
     if failed_urls:
         failed_path = Path(output_dir) / 'failed_urls.txt'

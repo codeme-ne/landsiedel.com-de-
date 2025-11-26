@@ -3,11 +3,14 @@ import time
 import logging
 import socket
 import ipaddress
+import atexit
 from urllib.parse import urlparse
-import requests
-from requests.exceptions import Timeout, ConnectionError as ReqConnError, HTTPError
+import httpx
 
 logger = logging.getLogger(__name__)
+
+# Module-level HTTP client for connection pooling
+_client: httpx.Client | None = None
 
 
 class FetchError(Exception):
@@ -106,10 +109,34 @@ def validate_url(url: str) -> None:
         raise SSRFError(f"Failed to resolve hostname: {e}") from e
 
 
+def _get_client() -> httpx.Client:
+    """
+    Get or create the module-level HTTP client with connection pooling.
+
+    Configured with:
+    - Connection pooling (max 10 connections, 5 keepalive)
+    - 10s default timeout
+    - Automatic redirect following
+    - Cleanup registered with atexit
+    """
+    global _client
+    if _client is None:
+        _client = httpx.Client(
+            timeout=httpx.Timeout(10.0),
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5
+            ),
+            follow_redirects=True
+        )
+        atexit.register(_client.close)
+    return _client
+
+
 def fetch(url: str, timeout: int = 10, retries: int = 3,
           user_agent: str = "landsiedel-translation-bot/1.0") -> tuple[str, dict]:
     """
-    Fetch URL with retries and validation.
+    Fetch URL with retries and validation using connection pooling.
 
     Returns (html, meta) where meta contains:
     - final_url: final URL after redirects
@@ -123,13 +150,19 @@ def fetch(url: str, timeout: int = 10, retries: int = 3,
     validate_url(url)
 
     headers = {'User-Agent': user_agent}
+    client = _get_client()
     last_error = None
 
     for attempt in range(retries):
         try:
             logger.info(f"Fetching {url} (attempt {attempt + 1}/{retries})")
 
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            # Use client with connection pooling
+            resp = client.get(
+                url,
+                headers=headers,
+                timeout=httpx.Timeout(float(timeout))
+            )
             resp.raise_for_status()
 
             # Validate content type
@@ -139,11 +172,11 @@ def fetch(url: str, timeout: int = 10, retries: int = 3,
                     f"Expected HTML but got {content_type}"
                 )
 
-            # Determine encoding
-            encoding = resp.encoding or resp.apparent_encoding
+            # Determine encoding (httpx handles this automatically)
+            encoding = resp.encoding or 'utf-8'
 
             meta = {
-                'final_url': resp.url,
+                'final_url': str(resp.url),
                 'encoding': encoding,
                 'content_type': content_type,
                 'status': resp.status_code,
@@ -151,16 +184,17 @@ def fetch(url: str, timeout: int = 10, retries: int = 3,
 
             return resp.text, meta
 
-        except HTTPError as e:
+        except httpx.HTTPStatusError as e:
             # Don't retry 4xx errors
-            if e.response and 400 <= e.response.status_code < 500:
+            if 400 <= e.response.status_code < 500:
                 raise FetchError(
                     f"HTTP {e.response.status_code}: {e}"
                 ) from e
             last_error = e
             logger.warning(f"HTTP error on attempt {attempt + 1}: {e}")
 
-        except (Timeout, ReqConnError) as e:
+        except (httpx.TimeoutException, httpx.ConnectError,
+                httpx.RemoteProtocolError) as e:
             last_error = e
             logger.warning(
                 f"Network error on attempt {attempt + 1}: {e}"

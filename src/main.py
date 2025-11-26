@@ -12,13 +12,9 @@ try:
 except ImportError:
     pass
 
-from src.fetcher import fetch, FetchError
-from src.parser import EmbeddedHtmlItem, JsonFieldItem, parse
-from src.translator import translate_batch, has_model, preview_batch
-from src.writer import (
-    apply_translations, rewrite_links,
-    set_lang, map_paths, save_html
-)
+from src.fetcher import FetchError
+from src.translator import has_model
+from src.pipeline import TranslationPipeline
 from src import batch
 
 logging.basicConfig(
@@ -143,96 +139,20 @@ def main():
 
     # Single-URL mode
     try:
-        # Step 1: Fetch
-        logger.info(f"Fetching {args.url}")
-        html, meta = fetch(
-            args.url,
+        pipeline = TranslationPipeline(
             timeout=args.timeout,
             retries=args.retries
         )
-        logger.info(
-            f"Fetched {len(html)} chars from {meta['final_url']}"
+        result = pipeline.process_url(
+            args.url,
+            args.output_dir,
+            dry_run=args.dry_run
         )
 
-        # Step 2: Parse
-        logger.info("Parsing HTML")
-        soup, items = parse(html)
-        logger.info(f"Found {len(items)} translatable items")
-
-        # Step 3: Extract texts for translation
-        texts_to_translate = []
-        for item in items:
-            if isinstance(item, tuple):  # (tag, attr)
-                tag, attr = item
-                texts_to_translate.append(tag[attr])
-            elif isinstance(item, JsonFieldItem):
-                texts_to_translate.append(item.get_value())
-            elif isinstance(item, EmbeddedHtmlItem):
-                texts_to_translate.append(item.get_value())
-            else:  # NavigableString
-                texts_to_translate.append(str(item))
-
-        # Step 4: Translate
         if args.dry_run:
-            plan = preview_batch(texts_to_translate, src='de', dst='en')
-            logger.info("Dry run summary for %s", args.url)
-            logger.info("  Total texts: %d", plan.total)
-            logger.info("  Cache hits: %d", plan.cache_hits)
-            logger.info("  Pending translations: %d", len(plan.pending))
-
-            for item in plan.pending[:5]:
-                snippet = str(item.original).strip().replace('\n', ' ')
-                if len(snippet) > 60:
-                    snippet = snippet[:57] + '...'
-                logger.info("    - idx %d: %s", item.index, snippet)
-
-            if len(plan.pending) > 5:
-                logger.info(
-                    "    ... %d additional texts",
-                    len(plan.pending) - 5
-                )
-
             logger.info("Dry run complete (no files written)")
-            sys.exit(0)
 
-        logger.info(f"Translating {len(texts_to_translate)} items")
-        translations = translate_batch(
-            texts_to_translate,
-            src='de',
-            dst='en'
-        )
-        logger.info("Translation complete")
-
-        # Step 5: Apply translations
-        logger.info("Applying translations")
-        apply_translations(soup, items, translations)
-
-        # Step 6: Rewrite links
-        logger.info("Rewriting /de/ -> /en/ links")
-        from urllib.parse import urlparse
-        domain = urlparse(meta['final_url']).netloc
-        rewrite_links(soup, from_prefix='/de/', to_prefix='/en/', domain=domain)
-
-        # Step 7: Set language
-        set_lang(soup, lang='en')
-
-        # Step 8: Save both versions
-        if 'final_url' not in meta:
-            logger.error("Missing final_url in fetch metadata")
-            sys.exit(1)
-        de_path, en_path = map_paths(meta['final_url'], args.output_dir)
-
-        logger.info(f"Saving DE version to {de_path}")
-        # Save original DE version (re-parse to get clean copy)
-        de_soup, _ = parse(html)
-        save_html(de_soup, de_path)
-
-        logger.info(f"Saving EN version to {en_path}")
-        save_html(soup, en_path)
-
-        logger.info("✓ Translation complete!")
-        logger.info(f"  DE: {de_path}")
-        logger.info(f"  EN: {en_path}")
+        sys.exit(0)
 
     except FetchError as e:
         logger.error(f"Fetch failed: {e}")

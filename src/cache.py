@@ -19,7 +19,7 @@ class TranslationCache:
     - SHA256-based cache keys (text + languages + model)
     - Batch get/set operations for efficiency
     - Automatic table creation
-    - Thread-safe (one connection per operation)
+    - Persistent connection with multi-threaded access
     """
 
     def __init__(self, cache_path: str = "translation_cache.db"):
@@ -29,20 +29,54 @@ class TranslationCache:
             cache_path: Path to SQLite database file
         """
         self.cache_path = Path(cache_path)
+        self._conn: Optional[sqlite3.Connection] = None
         self._ensure_table()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Get or create the database connection.
+
+        Returns:
+            Persistent SQLite connection with timeout and busy handling
+        """
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                str(self.cache_path),
+                check_same_thread=False,  # Allow multi-threaded access
+                timeout=5.0  # Prevent indefinite hangs
+            )
+            self._conn.execute("PRAGMA busy_timeout = 5000")
+        return self._conn
+
+    def close(self):
+        """Close the database connection."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, *args):
+        """Context manager exit - ensures connection cleanup."""
+        self.close()
+
+    def __del__(self):
+        """Cleanup connection on garbage collection."""
+        self.close()
 
     def _ensure_table(self):
         """Create cache table if it doesn't exist"""
-        with sqlite3.connect(self.cache_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS translations (
-                    cache_key TEXT PRIMARY KEY,
-                    translation TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            # Index on cache_key for fast lookups (implicit via PRIMARY KEY)
-            conn.commit()
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS translations (
+                cache_key TEXT PRIMARY KEY,
+                translation TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Index on cache_key for fast lookups (implicit via PRIMARY KEY)
+        self.conn.commit()
 
     def _make_key(
         self,
@@ -94,18 +128,17 @@ class TranslationCache:
 
         # Query database
         results = {}
-        with sqlite3.connect(self.cache_path) as conn:
-            # Use parameterized query with placeholders
-            placeholders = ','.join('?' * len(cache_keys))
-            query = f"""
-                SELECT cache_key, translation
-                FROM translations
-                WHERE cache_key IN ({placeholders})
-            """
-            cursor = conn.execute(query, cache_keys)
+        # Use parameterized query with placeholders
+        placeholders = ','.join('?' * len(cache_keys))
+        query = f"""
+            SELECT cache_key, translation
+            FROM translations
+            WHERE cache_key IN ({placeholders})
+        """
+        cursor = self.conn.execute(query, cache_keys)
 
-            # Build reverse lookup: cache_key -> translation
-            key_to_translation = {row[0]: row[1] for row in cursor}
+        # Build reverse lookup: cache_key -> translation
+        key_to_translation = {row[0]: row[1] for row in cursor}
 
         # Map back to original texts
         for text, cache_key in key_map.items():
@@ -141,21 +174,19 @@ class TranslationCache:
             for text, translation in data.items()
         ]
 
-        with sqlite3.connect(self.cache_path) as conn:
-            # Use REPLACE to update existing entries
-            conn.executemany(
-                "REPLACE INTO translations (cache_key, translation) VALUES (?, ?)",
-                rows
-            )
-            conn.commit()
+        # Use REPLACE to update existing entries
+        self.conn.executemany(
+            "REPLACE INTO translations (cache_key, translation) VALUES (?, ?)",
+            rows
+        )
+        self.conn.commit()
 
         logger.info(f"Cached {len(rows)} new translations")
 
     def clear(self):
         """Clear all cached translations"""
-        with sqlite3.connect(self.cache_path) as conn:
-            conn.execute("DELETE FROM translations")
-            conn.commit()
+        self.conn.execute("DELETE FROM translations")
+        self.conn.commit()
         logger.info("Cache cleared")
 
     def stats(self) -> dict:
@@ -164,15 +195,14 @@ class TranslationCache:
         Returns:
             Dict with cache stats (size, oldest, newest)
         """
-        with sqlite3.connect(self.cache_path) as conn:
-            cursor = conn.execute("""
-                SELECT
-                    COUNT(*) as total,
-                    MIN(created_at) as oldest,
-                    MAX(created_at) as newest
-                FROM translations
-            """)
-            row = cursor.fetchone()
+        cursor = self.conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                MIN(created_at) as oldest,
+                MAX(created_at) as newest
+            FROM translations
+        """)
+        row = cursor.fetchone()
 
         return {
             "total_entries": row[0],
