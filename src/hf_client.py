@@ -20,6 +20,25 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
+# Suppress httpx debug logs to prevent token leakage
+logging.getLogger('httpx').setLevel(logging.ERROR)
+
+
+def _redact_token(token: str) -> str:
+    """Redact API token for safe logging.
+
+    Args:
+        token: API token to redact
+
+    Returns:
+        Redacted token string
+    """
+    if not token:
+        return "[EMPTY]"
+    if len(token) <= 8:
+        return "****"
+    return f"{token[:4]}...{token[-4:]}"
+
 
 # Custom exceptions for better error handling
 class HfApiError(Exception):

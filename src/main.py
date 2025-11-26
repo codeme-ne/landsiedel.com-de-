@@ -26,10 +26,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# Suppress noisy library loggers
+# Suppress noisy library loggers and prevent token leakage
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
-logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 

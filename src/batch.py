@@ -58,13 +58,26 @@ def load_sitemap_json(path: str) -> list[str]:
 def load_sitemap_xml(path: str) -> list[str]:
     """
     Load URLs from sitemap.xml.
-    
+
     Handles standard sitemap.org schema with namespaces.
     Filters: Only /de/ URLs from www.landsiedel.com
     Returns: Deduplicated list of URLs
+    Raises: etree.XMLSyntaxError if XML is malformed or contains unsafe entities
     """
-    tree = etree.parse(path)
-    root = tree.getroot()
+    # Create secure parser to prevent XXE attacks
+    parser = etree.XMLParser(
+        resolve_entities=False,  # Disable external entity resolution
+        no_network=True,         # Block network access
+        dtd_validation=False,    # Disable DTD validation
+        load_dtd=False           # Do not load DTDs
+    )
+
+    try:
+        tree = etree.parse(path, parser)
+        root = tree.getroot()
+    except etree.XMLSyntaxError as e:
+        logger.error(f"XML parsing failed for {path}: {e}")
+        raise
     
     # Extract URLs (namespace-safe)
     urls = set()

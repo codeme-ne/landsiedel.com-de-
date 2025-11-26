@@ -1,6 +1,7 @@
 """HTML writer with translation application and link rewriting"""
 import json
 import logging
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup, NavigableString
@@ -114,6 +115,35 @@ def set_lang(soup: BeautifulSoup, lang: str = 'en') -> None:
         soup.html['lang'] = lang
 
 
+def _validate_safe_path(path: str, output_base: Path) -> None:
+    """
+    Validate that a path is safe and does not traverse outside output directory.
+
+    Raises:
+        ValueError: If path contains traversal attempts or unsafe characters
+    """
+    # Check for '..' in path components
+    path_obj = Path(path)
+    if '..' in path_obj.parts:
+        raise ValueError(f"Path traversal detected: path contains '..' component")
+
+    # Validate path contains only safe characters
+    safe_pattern = re.compile(r'^[a-zA-Z0-9/_.-]+$')
+    if not safe_pattern.match(str(path_obj)):
+        raise ValueError(f"Path contains unsafe characters: {path}")
+
+    # Resolve to absolute path and verify it starts with output_base
+    try:
+        resolved = (output_base / path_obj).resolve()
+        base_resolved = output_base.resolve()
+
+        # Check if resolved path is within output directory
+        if not str(resolved).startswith(str(base_resolved)):
+            raise ValueError(f"Path traversal detected: {path} resolves outside output directory")
+    except (ValueError, OSError) as e:
+        raise ValueError(f"Invalid path: {path}") from e
+
+
 def map_paths(url: str, output_dir: str) -> tuple[str, str]:
     """
     Map URL to output file paths for DE and EN versions.
@@ -123,6 +153,15 @@ def map_paths(url: str, output_dir: str) -> tuple[str, str]:
     - Strip /de/ language prefix from path
     - Empty path or trailing slash -> .../index.html
     - Keep .html filenames
+
+    Security:
+    - Validates against path traversal attacks
+    - Ensures output stays within output_dir
+    - Blocks paths with '..' components
+    - Validates safe characters only
+
+    Raises:
+        ValueError: If URL path contains traversal attempts or unsafe characters
     """
     parsed = urlparse(url)
     path = parsed.path
@@ -142,8 +181,12 @@ def map_paths(url: str, output_dir: str) -> tuple[str, str]:
         # Add .html if no extension
         path = path + '.html'
 
-    de_path = str(Path(output_dir) / 'de' / path)
-    en_path = str(Path(output_dir) / 'en' / path)
+    # Validate path safety BEFORE constructing final paths
+    output_base = Path(output_dir)
+    _validate_safe_path(path, output_base)
+
+    de_path = str(output_base / 'de' / path)
+    en_path = str(output_base / 'en' / path)
 
     return de_path, en_path
 

@@ -1,6 +1,9 @@
 """HTTP fetcher with retry logic and validation"""
 import time
 import logging
+import socket
+import ipaddress
+from urllib.parse import urlparse
 import requests
 from requests.exceptions import Timeout, ConnectionError as ReqConnError, HTTPError
 
@@ -10,6 +13,97 @@ logger = logging.getLogger(__name__)
 class FetchError(Exception):
     """Raised when fetch fails after retries"""
     pass
+
+
+class SSRFError(FetchError):
+    """Raised when URL fails SSRF validation"""
+    pass
+
+
+# Private IP ranges to block
+PRIVATE_IP_RANGES = [
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('169.254.0.0/16'),  # Link-local
+    ipaddress.ip_network('127.0.0.0/8'),     # Loopback
+    ipaddress.ip_network('::1/128'),         # IPv6 loopback
+    ipaddress.ip_network('fc00::/7'),        # IPv6 private
+    ipaddress.ip_network('fe80::/10'),       # IPv6 link-local
+]
+
+# Cloud metadata endpoints
+METADATA_IPS = ['169.254.169.254']
+
+
+def validate_url(url: str) -> None:
+    """
+    Validate URL to prevent SSRF attacks.
+
+    Blocks:
+    - Non-HTTP(S) schemes
+    - Localhost, 127.0.0.1, 0.0.0.0, ::1
+    - Cloud metadata endpoint (169.254.169.254)
+    - Private IP ranges (10.x, 172.16-31.x, 192.168.x)
+    - Link-local addresses
+
+    Raises SSRFError if URL is blocked.
+    """
+    parsed = urlparse(url)
+
+    # Only allow HTTP and HTTPS
+    if parsed.scheme not in ('http', 'https'):
+        raise SSRFError(
+            f"Invalid scheme '{parsed.scheme}': only http/https allowed"
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise SSRFError("URL must contain a hostname")
+
+    # Block localhost variants
+    localhost_names = {'localhost', 'localhost.localdomain'}
+    if hostname.lower() in localhost_names:
+        raise SSRFError(f"Access to localhost is blocked")
+
+    # Resolve hostname to IP and validate
+    try:
+        # Get all IP addresses for this hostname
+        addr_info = socket.getaddrinfo(hostname, None)
+        ips = {info[4][0] for info in addr_info}
+
+        for ip_str in ips:
+            # Parse as IP address
+            ip = ipaddress.ip_address(ip_str)
+
+            # Block loopback
+            if ip.is_loopback:
+                raise SSRFError(
+                    f"Loopback address blocked: {ip_str}"
+                )
+
+            # Block link-local
+            if ip.is_link_local:
+                raise SSRFError(
+                    f"Link-local address blocked: {ip_str}"
+                )
+
+            # Block cloud metadata endpoint
+            if ip_str in METADATA_IPS:
+                raise SSRFError(
+                    f"Cloud metadata endpoint blocked: {ip_str}"
+                )
+
+            # Block private IP ranges
+            for private_range in PRIVATE_IP_RANGES:
+                if ip in private_range:
+                    raise SSRFError(
+                        f"Private IP address blocked: {ip_str} "
+                        f"(in {private_range})"
+                    )
+
+    except socket.gaierror as e:
+        raise SSRFError(f"Failed to resolve hostname: {e}") from e
 
 
 def fetch(url: str, timeout: int = 10, retries: int = 3,
@@ -25,6 +119,9 @@ def fetch(url: str, timeout: int = 10, retries: int = 3,
 
     Raises FetchError for non-HTML, 4xx/5xx after retries, or timeouts.
     """
+    # Validate URL to prevent SSRF attacks
+    validate_url(url)
+
     headers = {'User-Agent': user_agent}
     last_error = None
 

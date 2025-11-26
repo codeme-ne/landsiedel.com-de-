@@ -34,7 +34,7 @@ def test_api_token():
         return False
 
     print("✓ PASS: API Token configured correctly")
-    print(f"   Token: {token[:10]}...{token[-5:]}")
+    print("   Token: [REDACTED]")
     return True
 
 
